@@ -49,68 +49,106 @@ pipeline {
             }
         }
         stage('Build and Push Images') {
-            parallel {
-                stage('Build for amd64') {
-                    agent { label 'docker && amd64' }
-                    steps {
-                        script {
-                            withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID,
-                                                             variable: 'GHCR_PAT')]) {
-                                sh '''
-                                echo $GHCR_PAT | wc -m
-                                echo "${GHCR_PAT}" | docker login "${GHCR_REGISTRY}" -u "${GHCR_USER}" --password-stdin
-                                docker build --label "org.opencontainers.image.source=${LABEL_ORG_OPENCONTAINERS_IMAGE_SOURCE}" --target base -t ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-amd64 .
-                                docker image inspect ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-amd64
-                                docker push ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-amd64
-                                '''
-                            }
-                        }
+            matrix {
+                axes {
+                    axis {
+                        name 'ARCH'
+                        values 'amd64', 'arm64'
+                    }
+                    axis {
+                        name 'DOCKER_STAGE'
+                        values 'final' // Add more stages if needed
                     }
                 }
-                stage('Build for arm64') {
-                    agent { label 'docker && arm64' }
-                    steps {
-                        script {
-                            withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID,
-                                                             variable: 'GHCR_PAT')]) {
-                                sh '''
-                                echo $GHCR_PAT | wc -m
-                                echo "${GHCR_PAT}" | docker login "${GHCR_REGISTRY}" -u "${GHCR_USER}" --password-stdin
-                                docker build --label "org.opencontainers.image.source=${LABEL_ORG_OPENCONTAINERS_IMAGE_SOURCE}" --target base -t ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-arm64 .
-                                docker image inspect ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-arm64
-                                docker push ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-arm64
-                                '''
+                agent { label "docker && ${ARCH}" }
+                stages {
+                    stage('Build and Push') {
+                        steps {
+                            script {
+                                withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID, variable: 'GHCR_PAT')]) {
+                                    sh '''
+                                    echo "${GHCR_PAT}" | docker login "${GHCR_REGISTRY}" -u "${GHCR_USER}" --password-stdin
+                                    docker build --label "org.opencontainers.image.source=${LABEL_ORG_OPENCONTAINERS_IMAGE_SOURCE}" --target ${DOCKER_STAGE} --build-arg ARCH=${ARCH} -t ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-${ARCH} .
+                                    docker image inspect ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-${ARCH}
+                                    docker push ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-${ARCH}
+                                    '''
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        stage('Create and Push Manifest') {
-            agent { label 'docker' } // Or use any node with Docker CLI
+        stage('Create and Push Stage Specific Manifests') {
+            matrix {
+                axes {
+                    axis {
+                        name 'DOCKER_STAGE'
+                        values 'final' // Add more stages if needed
+                    }
+                }
+                agent { label 'docker' }
+                environment {
+                    ARCHS = 'amd64 arm64'
+                }
+                stages {
+                    stage('Push Manifest') {
+                        steps {
+                            script {
+                                withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID, variable: 'GHCR_PAT')]) {
+                                    sh '''
+                                    echo "${GHCR_PAT}" | docker login ${GHCR_REGISTRY} -u "${GHCR_USER}" --password-stdin
+                                    manifest_tag="${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}"
+                                    # Remove manifest if exists
+                                    docker manifest rm $manifest_tag || true
+                                    # Build manifest create command
+                                    manifest_create_cmd="docker manifest create $manifest_tag"
+                                    for arch in $ARCHS; do
+                                      manifest_create_cmd="$manifest_create_cmd ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-$arch"
+                                    done
+                                    manifest_create_cmd="$manifest_create_cmd --amend"
+                                    eval $manifest_create_cmd
+                                    # Annotate for each arch
+                                    for arch in $ARCHS; do
+                                      docker manifest annotate $manifest_tag ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-$arch --os linux --arch $arch
+                                    done
+                                    docker manifest inspect $manifest_tag
+                                    docker manifest push $manifest_tag --purge
+                                    '''
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Create and Push Final Manifest') {
+            agent { label 'docker' }
+            environment {
+                ARCHS = 'amd64 arm64'
+                DOCKER_STAGE = 'final' // Ensure this matches the stage used in the build step
+            }
             steps {
                 script {
-                    withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID,
-                                                        variable: 'GHCR_PAT')]) {
+                    withCredentials([string(credentialsId: GHCR_CREDENTIALS_ID, variable: 'GHCR_PAT')]) {
                         sh '''
                         echo "${GHCR_PAT}" | docker login ${GHCR_REGISTRY} -u "${GHCR_USER}" --password-stdin
-
-                        docker manifest rm ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME} || true
-
-                        docker manifest create ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME} \
-                            ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-amd64 \
-                            ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-arm64 --amend
-
-                        docker manifest annotate ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME} \
-                            ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-amd64 --os linux --arch amd64
-
-                        docker manifest annotate ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME} \
-                            ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-arm64 --os linux --arch arm64
-
-                        # dump the manifest to see what it looks like
-                        docker manifest inspect ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}
-
-                        docker manifest push ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME} --purge
+                        manifest_tag="${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}"
+                        # Remove manifest if exists
+                        docker manifest rm $manifest_tag || true
+                        # Build manifest create command
+                        manifest_create_cmd="docker manifest create $manifest_tag"
+                        for arch in $ARCHS; do
+                          manifest_create_cmd="$manifest_create_cmd ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-$arch"
+                        done
+                        manifest_create_cmd="$manifest_create_cmd --amend"
+                        eval $manifest_create_cmd
+                        # Annotate for each arch
+                        for arch in $ARCHS; do
+                          docker manifest annotate $manifest_tag ${GHCR_REGISTRY}/${GHCR_REPOSITORY}:${DYNAMIC_TAG_NAME}-${DOCKER_STAGE}-$arch --os linux --arch $arch
+                        done
+                        docker manifest inspect $manifest_tag
+                        docker manifest push $manifest_tag --purge
                         '''
                     }
                 }
